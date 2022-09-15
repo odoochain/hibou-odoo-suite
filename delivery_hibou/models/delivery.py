@@ -17,9 +17,54 @@ class DeliveryCarrier(models.Model):
                                             string='Procurement Priority',
                                             help='Priority for this carrier. Will affect pickings '
                                                  'and procurements related to this carrier.')
+    package_by_field = fields.Selection([
+        ('', 'Use Default Package Type'),
+        ('weight', 'Weight'),
+        ('volume', 'Volume'),
+    ], string='Packaging by Product Field')
+
+    # Package selection
+    def get_package_type_for_order(self, order):
+        if self.package_by_field == 'weight':
+            return self._get_package_type_for_order(order, 'max_weight', 'weight')
+        elif self.package_by_field == 'volume':
+            return self._get_package_type_for_order(order, 'package_volume', 'volume')
+        attr = getattr(self, '%s_default_packaging_id' % (self.delivery_type, ), None)
+        if attr:
+            return attr()
+        attr = getattr(self, '%s_default_package_type_id' % (self.delivery_type, ), None)
+        if attr:
+            return attr()
+        return self.env['stock.package.type']
+
+    def _get_package_type_for_order(self, order, package_type_field, product_field):
+        order_total = sum(order.order_line.filtered(lambda ol: ol.product_id.type in ('product', 'consu')).mapped(lambda ol: ol.product_id[product_field] * ol.product_uom_qty))
+        if order_total:
+            package_types = self.env['stock.package.type'].search([
+                ('package_carrier_type', 'in', ('none', False, self.delivery_type)),
+                ('use_in_package_selection', '=', True),
+            ], order=package_type_field)
+            package_type = None
+            for package_type in package_types:
+                if package_type[package_type_field] >= order_total:
+                    return package_type
+            return package_types if not package_type else package_type
 
     # Utility
+    def get_to_ship_picking_packages(self, picking):
+        # Will return a stock.quant.package record set if the picking has packages
+        # in the case of multi-packing and none applicable, will return None
+        # Additionally, will not return packages that have a tracking number (because they have shipped)
+        picking_packages = picking.package_ids
+        package_carriers = picking_packages.mapped('carrier_id')
+        if package_carriers:
+            # only ship ours
+            picking_packages = picking_packages.filtered(lambda p: p.carrier_id == self and not p.carrier_tracking_ref)
 
+            if package_carriers and not picking_packages:
+                return None
+        return picking_packages
+    
     def get_insurance_value(self, order=None, picking=None, package=None):
         value = 0.0
         if order:
@@ -223,7 +268,7 @@ class DeliveryCarrier(models.Model):
         else:
             if packages:
                 raise UserError(_('Cannot rate package without picking.'))
-            self = self.with_context(date_planned=(order.date_planned or fields.Datetime.now()))
+            self = self.with_context(date_planned=('date_planned' in order._fields and order.date_planned or fields.Datetime.now()))
 
         res = []
         for carrier in self:
